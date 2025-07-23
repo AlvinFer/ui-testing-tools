@@ -74,10 +74,241 @@ function createSafeFileName(url) {
   }
 }
 
+// Add spinner utility functions
+function showSpinner(message) {
+  const spinnerChars = ['|', '/', '-', '\\'];
+  let i = 0;
+  return setInterval(() => {
+    process.stdout.write(`\r${message} ${spinnerChars[i++ % spinnerChars.length]}`);
+  }, 100);
+}
+
+function stopSpinner(interval, finalMessage) {
+  clearInterval(interval);
+  process.stdout.write(`\r${finalMessage}\n`);
+}
+
+// Add URL validation and domain extraction functions
+function isValidUrl(string) {
+  try {
+    new URL(string);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getDomain(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeUrl(url, baseUrl) {
+  try {
+    // Handle relative URLs
+    if (url.startsWith('/')) {
+      const base = new URL(baseUrl);
+      return `${base.protocol}//${base.host}${url}`;
+    }
+    if (url.startsWith('#')) {
+      return null; // Skip anchor links
+    }
+    if (url.startsWith('mailto:') || url.startsWith('tel:') || url.startsWith('javascript:')) {
+      return null; // Skip non-http protocols
+    }
+    
+    const fullUrl = new URL(url, baseUrl);
+    // Remove fragment (hash)
+    fullUrl.hash = '';
+    return fullUrl.href;
+  } catch {
+    return null;
+  }
+}
+
+function getPathDepth(url) {
+  try {
+    const urlObj = new URL(url);
+    const pathParts = urlObj.pathname.split('/').filter(part => part.length > 0);
+    return pathParts.length;
+  } catch {
+    return 0;
+  }
+}
+
+// Add function to get local timestamp
+function getLocalTimestamp() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const day = String(now.getDate()).padStart(2, '0');
+  const hours = String(now.getHours()).padStart(2, '0');
+  const minutes = String(now.getMinutes()).padStart(2, '0');
+  const seconds = String(now.getSeconds()).padStart(2, '0');
+  
+  return `${year}-${month}-${day}T${hours}-${minutes}-${seconds}`;
+}
+
+async function crawlAndScreenshot(startUrl) {
+  const domain = getDomain(startUrl);
+  if (!domain) {
+    throw new Error('Invalid starting URL');
+  }
+
+  const browser = await chromium.launch();
+  const page = await browser.newPage();
+  await page.setViewportSize({ width: 1920, height: 1080 });
+
+  const visitedUrls = new Set();
+  const urlsToVisit = [startUrl];
+  const pages = [];
+  
+  // Create baseline folder with local timestamp
+  const timestamp = getLocalTimestamp();
+  const safeDomain = domain.replace(/[^a-zA-Z0-9.-]/g, '_');
+  const folderName = `${safeDomain}-${timestamp}`;
+  const folderPath = path.join(BASELINE_DIR, folderName);
+  
+  if (!fs.existsSync(folderPath)) {
+    fs.mkdirSync(folderPath, { recursive: true });
+  }
+
+  let spinner = showSpinner('Crawling and taking screenshots');
+
+  while (urlsToVisit.length > 0) {
+    const currentUrl = urlsToVisit.shift();
+    
+    if (visitedUrls.has(currentUrl)) {
+      continue;
+    }
+    
+    visitedUrls.add(currentUrl);
+    
+    try {
+      stopSpinner(spinner, `Processing: ${currentUrl}`);
+      spinner = showSpinner('Crawling and taking screenshots');
+
+      // Navigate to page
+      await page.goto(currentUrl, { timeout: 100000, waitUntil: 'networkidle' });
+      
+      // Get page info
+      const title = await page.title();
+      const canonical = await page.evaluate(() => {
+        const canonicalElement = document.querySelector('link[rel="canonical"]');
+        return canonicalElement ? canonicalElement.href : null;
+      });
+
+      // Take screenshot
+      const fileName = createSafeFileName(currentUrl);
+      const screenshotPath = path.join(folderPath, `${fileName}.png`);
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+
+      // Determine page type and depth
+      const pathDepth = getPathDepth(currentUrl);
+      const pageType = currentUrl === startUrl ? 'main' : 'sub';
+
+      // Store page info
+      const pageInfo = {
+        url: currentUrl,
+        type: pageType,
+        pathDepth: pathDepth,
+        path: new URL(currentUrl).pathname,
+        status: 'success',
+        title: title,
+        screenshotPath: screenshotPath,
+        errorMessage: null,
+        canonical: canonical || currentUrl
+      };
+      
+      pages.push(pageInfo);
+
+      // Extract links from current page
+      const links = await page.evaluate(() => {
+        const anchors = Array.from(document.querySelectorAll('a[href]'));
+        return anchors.map(a => a.href);
+      });
+
+      // Process discovered links
+      for (const link of links) {
+        const normalizedUrl = normalizeUrl(link, currentUrl);
+        if (normalizedUrl && 
+            getDomain(normalizedUrl) === domain && 
+            !visitedUrls.has(normalizedUrl) && 
+            !urlsToVisit.includes(normalizedUrl)) {
+          urlsToVisit.push(normalizedUrl);
+        }
+      }
+
+    } catch (error) {
+      // Handle errors - add failed page info and continue
+      const fileName = createSafeFileName(currentUrl);
+      const pageInfo = {
+        url: currentUrl,
+        type: currentUrl === startUrl ? 'main' : 'sub',
+        pathDepth: getPathDepth(currentUrl),
+        path: new URL(currentUrl).pathname,
+        status: 'error',
+        title: null,
+        screenshotPath: null,
+        errorMessage: error.message,
+        canonical: currentUrl
+      };
+      
+      pages.push(pageInfo);
+      stopSpinner(spinner, `Error processing ${currentUrl}: ${error.message}`);
+      spinner = showSpinner('Crawling and taking screenshots');
+    }
+  }
+
+  await browser.close();
+  stopSpinner(spinner, 'Crawling completed!');
+
+  // Save pages.json
+  const pagesJsonPath = path.join(folderPath, 'pages.json');
+  fs.writeFileSync(pagesJsonPath, JSON.stringify(pages, null, 2));
+
+  return {
+    folderPath,
+    totalPages: pages.length,
+    successPages: pages.filter(p => p.status === 'success').length,
+    errorPages: pages.filter(p => p.status === 'error').length
+  };
+}
+
 async function baselineMenu() {
   log('\n=== Baseline Menu ===');
-  log('This feature is not yet implemented in this version.');
-  log('Returning to main menu.');
+  const startUrl = await ask('Enter the starting URL to crawl: ');
+  
+  if (!isValidUrl(startUrl)) {
+    log('Invalid URL provided. Returning to main menu.');
+    await mainMenu();
+    return;
+  }
+
+  try {
+    ensureBaselineDir();
+    
+    log(`Starting baseline creation for: ${startUrl}`);
+    const result = await crawlAndScreenshot(startUrl);
+    
+    log('\n=== Baseline Creation Complete ===');
+    log(`Baseline saved to: ${result.folderPath}`);
+    log(`Total pages processed: ${result.totalPages}`);
+    log(`Successful screenshots: ${result.successPages}`);
+    log(`Failed pages: ${result.errorPages}`);
+    
+    if (result.errorPages > 0) {
+      log('Some pages failed to load. Check the pages.json file for error details.');
+    }
+    
+  } catch (error) {
+    log(`Error creating baseline: ${error.message}`);
+  }
+  
+  log('\nReturning to main menu.');
   await mainMenu();
 }
 
@@ -123,7 +354,7 @@ async function compareMenu() {
   }
   log('\nSelect a baseline to compare:');
   options.forEach((opt, idx) => {
-    log(`  [${idx + 1}] Website: ${opt.website}, Date: ${opt.date}`);
+    log(`  [${idx + 1}] Website: ${opt.website}`);
   });
   const answer = await ask('Enter number: ');
   const idx = parseInt(answer, 10);
@@ -150,15 +381,34 @@ async function compareMenu() {
   // Prepare for pixelmatch
   const pixelmatch = (await import('pixelmatch')).default;
   const PNG = (await import('pngjs')).PNG;
+  
+  // Add tracking for all page categories and overall statistics
   let matchCount = 0;
   let changeCount = 0;
+  let errorCount = 0;
   const changedPages = [];
+  const unchangedPages = [];
+  const errorPages = [];
+  
+  // Add overall difference tracking
+  let totalPixelsCompared = 0;
+  let totalDiffPixels = 0;
+  let successfulComparisons = 0;
+  
   const browser = await chromium.launch();
   const page = await browser.newPage();
   await page.setViewportSize({ width: 1920, height: 1080 });
+  
+  let spinner = showSpinner(`Comparing pages (0/${successPages.length})`);
+  let processedCount = 0;
+  
   for (const p of successPages) {
     try {
-      await page.goto(p.url, { timeout: 10000000 });
+      // Update spinner with current progress
+      stopSpinner(spinner, `Processing: ${p.url} (${processedCount + 1}/${successPages.length})`);
+      spinner = showSpinner(`Comparing pages (${processedCount + 1}/${successPages.length})`);
+      
+      await page.goto(p.url, { timeout: 100000 });
       const fileName = createSafeFileName(p.url);
       const newScreenshot = path.join(tempFolder, `${fileName}.png`);
       await page.screenshot({ path: newScreenshot, fullPage: true });
@@ -175,20 +425,41 @@ async function compareMenu() {
         const diffPath = path.join(tempFolder, `${fileName}_diff.png`);
         fs.writeFileSync(diffPath, PNG.sync.write(diff));
         const percentDiff = diffPixels / (width * height);
+        
+        // Add to overall statistics
+        totalPixelsCompared += (width * height);
+        totalDiffPixels += diffPixels;
+        successfulComparisons++;
+        
         if (percentDiff < 0.01) { // less than 1% difference is considered a match
           matchCount++;
+          unchangedPages.push({ url: p.url, title: p.title, percentDiff: (percentDiff * 100).toFixed(2) });
         } else {
           changeCount++;
           changedPages.push({ url: p.url, diff: diffPath, percentDiff: (percentDiff * 100).toFixed(2) });
         }
       } else {
-        log(`Baseline screenshot not found for ${p.url}`);
+        errorCount++;
+        errorPages.push({ url: p.url, error: 'Baseline screenshot not found' });
       }
     } catch (err) {
-      log(`Error comparing ${p.url}: ${err.message}`);
+      errorCount++;
+      errorPages.push({ url: p.url, error: err.message });
+      stopSpinner(spinner, `Error processing ${p.url}: ${err.message}`);
+      spinner = showSpinner(`Comparing pages (${processedCount + 1}/${successPages.length})`);
     }
+    
+    processedCount++;
   }
+  
+  stopSpinner(spinner, `Comparison completed! Processed ${processedCount}/${successPages.length} pages`);
   await browser.close();
+  
+  // Calculate overall difference percentage
+  const overallDiffPercentage = successfulComparisons > 0 
+    ? ((totalDiffPixels / totalPixelsCompared) * 100).toFixed(2)
+    : '0.00';
+  
   // Generate report file
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
   const reportFile = path.join(RESULT_DIR, `compare_${selected.website}_${selected.date}_${timestamp}.txt`);
@@ -199,21 +470,41 @@ async function compareMenu() {
   report += `Total pages compared: ${successPages.length}\n`;
   report += `Pages matched: ${matchCount}\n`;
   report += `Pages changed: ${changeCount}\n`;
+  report += `Pages with errors: ${errorCount}\n`;
+  report += `Overall difference: ${overallDiffPercentage}%\n`;
+  
   if (changedPages.length > 0) {
     report += '\nChanged pages:\n';
     changedPages.forEach((c, i) => {
       report += `  [${i + 1}] ${c.url} (diff: ${c.diff}, diff: ${c.percentDiff}%)\n`;
     });
   }
+  
+  if (unchangedPages.length > 0) {
+    report += '\nUnchanged pages:\n';
+    unchangedPages.forEach((u, i) => {
+      report += `  [${i + 1}] ${u.url} (${u.title || 'No title'}, diff: ${u.percentDiff}%)\n`;
+    });
+  }
+  
+  if (errorPages.length > 0) {
+    report += '\nPages with errors:\n';
+    errorPages.forEach((e, i) => {
+      report += `  [${i + 1}] ${e.url} (Error: ${e.error})\n`;
+    });
+  }
+  
   fs.writeFileSync(reportFile, report);
   log(`\n=== Compare Report ===`);
   log(`Report saved to: ${reportFile}`);
   log(`Total pages compared: ${successPages.length}`);
   log(`Pages matched: ${matchCount}`);
   log(`Pages changed: ${changeCount}`);
+  log(`Pages with errors: ${errorCount}`);
+  log(`Overall difference: ${overallDiffPercentage}%`);
   if (changedPages.length > 0) {
     log('Changed pages:');
-    changedPages.forEach((c, i) => log(`  [${i + 1}] ${c.url} (diff: ${c.diff}, diff: ${c.percentDiff}%)`));
+    changedPages.forEach((c, i) => log(`  [${i + 1}] ${c.url} (diff: ${c.percentDiff}%)`));
   }
   log('Compare complete. Returning to main menu.');
   await mainMenu();
